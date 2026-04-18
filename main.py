@@ -120,24 +120,61 @@ STRIP_RE = re.compile(
     re.IGNORECASE,
 )
 
-YEAR_RE = re.compile(r"[\(\.\s]((?:19|20)\d{2})[\)\.\s]")
+YEAR_RE = re.compile(r"[\(\[\.\s]((?:19|20)\d{2})[\)\]\.\s\-]")
+BRACKET_RE = re.compile(r"\[[^\]]*\]")
+EQUALS_TAG_RE = re.compile(r"=[^=]*=")
+TRAILING_GENRE_RE = re.compile(
+    r"\s+(?:drama|comedy|action|horror|thriller|romance|romantic|"
+    r"sci[\-\s]?fi|scifi|fantasy|mystery|crime|documentary|animation|"
+    r"adventure|family|western|war|musical|biography|history|"
+    r"foreign|indie|anime)(?:\s+(?:drama|comedy|action|horror|thriller|"
+    r"romance|romantic|sci[\-\s]?fi|scifi|fantasy|mystery|crime|"
+    r"documentary|animation|adventure|family|western|war|musical|"
+    r"biography|history|foreign|indie|anime))*\s*$",
+    re.IGNORECASE,
+)
 
 
 def parse_title(torrent_name):
-    name = torrent_name.replace(".", " ").replace("_", " ")
-    # Strip from the first tag onward
-    name = STRIP_RE.sub("", name)
-    # Remove any trailing year in parentheses for cleaner search
-    year_match = YEAR_RE.search(torrent_name)
+    name = html.unescape(torrent_name)
+    # Pull year out before we strip brackets
+    year_match = YEAR_RE.search(name)
     year = year_match.group(1) if year_match else None
-    name = re.sub(r"\s*\(?\d{4}\)?\s*$", "", name).strip()
+    # Strip [year - country] / [anything] and =tag= markers
+    name = BRACKET_RE.sub(" ", name)
+    name = EQUALS_TAG_RE.sub(" ", name)
+    name = name.replace(".", " ").replace("_", " ")
+    # Strip from the first technical tag onward
+    name = STRIP_RE.sub("", name)
+    # Strip trailing genre hints
+    name = TRAILING_GENRE_RE.sub("", name)
+    # Remove any remaining standalone trailing year
+    name = re.sub(r"\s*\(?\d{4}\)?\s*$", "", name)
+    # Collapse whitespace and trim punctuation
+    name = re.sub(r"\s+", " ", name).strip(" -–—")
     log.info("Parsed title: %r -> %r (year=%s)", torrent_name, name, year)
     return name, year
 
 
 # ---------------------------------------------------------------------------
-# IMDB scraper
+# IMDB via api.imdbapi.dev (free JSON API — imdb.com itself is WAF-blocked)
 # ---------------------------------------------------------------------------
+IMDB_API_BASE = "https://api.imdbapi.dev"
+
+
+def _imdb_info_from_payload(payload):
+    info = {"poster": "", "summary": "", "genre": "", "rating": ""}
+    img = payload.get("primaryImage") or {}
+    info["poster"] = img.get("url", "") or ""
+    info["summary"] = (payload.get("plot") or "")[:300]
+    genres = payload.get("genres") or []
+    info["genre"] = ", ".join(genres) if isinstance(genres, list) else str(genres)
+    rating = (payload.get("rating") or {}).get("aggregateRating")
+    if rating is not None:
+        info["rating"] = f"{rating}/10"
+    return info
+
+
 def fetch_imdb(imdb_id, title):
     if imdb_id and imdb_id != "0" and imdb_id.startswith("tt"):
         cache_key = f"imdb:{imdb_id}"
@@ -146,60 +183,38 @@ def fetch_imdb(imdb_id, title):
 
     cached = cache_get(cache_key)
     if cached is not None:
-        log.info("IMDB cache hit for %s", cache_key)
         return cached
 
     info = {"poster": "", "summary": "", "genre": "", "rating": ""}
 
     try:
         if imdb_id and imdb_id != "0" and imdb_id.startswith("tt"):
-            url = f"https://www.imdb.com/title/{imdb_id}/"
-            log.info("Fetching IMDB page by ID: %s", url)
+            url = f"{IMDB_API_BASE}/titles/{imdb_id}"
+            log.info("Fetching IMDB by ID: %s", url)
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            if resp.status_code == 200:
+                info = _imdb_info_from_payload(resp.json())
         else:
-            # Fallback: search by title
-            search_url = f"https://www.imdb.com/find?q={requests.utils.quote(title)}&s=tt"
+            search_url = f"{IMDB_API_BASE}/search/titles?query={requests.utils.quote(title)}"
             log.info("Searching IMDB by title: %s", search_url)
             resp = requests.get(search_url, headers=HEADERS, timeout=10)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            link = soup.select_one("a[href*='/title/tt']")
-            if not link:
-                log.info("No IMDB result found for title %r", title)
-                cache_set(cache_key, info)
-                return info
-            href = link["href"].split("?")[0]
-            url = f"https://www.imdb.com{href}"
-            log.info("Following IMDB link: %s", url)
-
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Poster
-        poster_tag = soup.select_one('img[class*="ipc-image"]')
-        if poster_tag and poster_tag.get("src"):
-            info["poster"] = poster_tag["src"]
-
-        # Summary — try JSON-LD first
-        ld_tag = soup.select_one('script[type="application/ld+json"]')
-        if ld_tag:
-            try:
-                ld = json.loads(ld_tag.string)
-                info["summary"] = ld.get("description", "")[:300]
-                info["genre"] = (
-                    ", ".join(ld["genre"])
-                    if isinstance(ld.get("genre"), list)
-                    else str(ld.get("genre", ""))
-                )
-                agg = ld.get("aggregateRating", {})
-                if agg.get("ratingValue"):
-                    info["rating"] = f"{agg['ratingValue']}/10"
-            except Exception:
-                pass
-
-        # Fallback summary from meta tag
-        if not info["summary"]:
-            meta = soup.select_one('meta[name="description"]')
-            if meta and meta.get("content"):
-                info["summary"] = meta["content"][:300]
+            if resp.status_code == 200:
+                titles = resp.json().get("titles") or []
+                if titles:
+                    # Search results don't include plot — refetch full record for the top hit.
+                    top_id = titles[0].get("id")
+                    if top_id:
+                        detail = requests.get(
+                            f"{IMDB_API_BASE}/titles/{top_id}",
+                            headers=HEADERS,
+                            timeout=10,
+                        )
+                        if detail.status_code == 200:
+                            info = _imdb_info_from_payload(detail.json())
+                        else:
+                            info = _imdb_info_from_payload(titles[0])
+                else:
+                    log.info("No IMDB result found for title %r", title)
 
     except Exception:
         log.exception("Error fetching IMDB data for %s", cache_key)
@@ -249,26 +264,16 @@ def fetch_rt(title):
         resp = requests.get(movie_url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Tomatometer score
-        score_tag = soup.select_one('rt-button[slot="criticsScore"]')
+        # Tomatometer / audience — current RT markup uses rt-text inside media-scorecard.
+        # Scope to the scorecard so we don't grab per-review scores further down the page.
+        scorecard = soup.select_one('media-scorecard') or soup
+        score_tag = scorecard.select_one('rt-text[slot="critics-score"]')
         if score_tag:
             info["tomatometer"] = score_tag.get_text(strip=True)
 
-        # Audience score
-        aud_tag = soup.select_one('rt-button[slot="audienceScore"]')
+        aud_tag = scorecard.select_one('rt-text[slot="audience-score"]')
         if aud_tag:
             info["audience"] = aud_tag.get_text(strip=True)
-
-        # Try alternate selectors if above didn't work
-        if not info["tomatometer"]:
-            tm = soup.select_one('[data-qa="tomatometer"]')
-            if tm:
-                info["tomatometer"] = tm.get_text(strip=True)
-
-        if not info["audience"]:
-            au = soup.select_one('[data-qa="audience-score"]')
-            if au:
-                info["audience"] = au.get_text(strip=True)
 
         # Critics consensus
         consensus_tag = soup.select_one('[data-qa="critics-consensus"]')
@@ -345,6 +350,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .seed { color: #4ecdc4; font-weight: bold; }
   .leech { color: #e94560; font-weight: bold; }
   .rating { color: #f9ca24; font-weight: bold; }
+  .magnet-cell { text-align: center; white-space: nowrap; }
+  .magnet-cell a, .magnet-cell button {
+    display: inline-block; padding: 4px 8px; margin: 2px;
+    background: #0f3460; color: #e94560; border: 1px solid #e94560;
+    border-radius: 4px; font-size: 0.75em; cursor: pointer;
+    font-family: inherit; text-decoration: none;
+  }
+  .magnet-cell a:hover, .magnet-cell button:hover {
+    background: #e94560; color: #fff; text-decoration: none;
+  }
+  .magnet-cell button.copied { background: #4ecdc4; color: #000; border-color: #4ecdc4; }
   #loading {
     text-align: center; padding: 40px; color: #888; font-size: 1.1em;
   }
@@ -366,6 +382,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <tr>
   <th>Poster</th>
   <th data-sort="title">Title<span class="arrow"></span></th>
+  <th>Magnet</th>
   <th>Genre</th>
   <th>Summary</th>
   <th data-sort="rating">Scores<span class="arrow"></span></th>
@@ -416,6 +433,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         '<div class="movie-title"><a href="' + esc(r.magnet) + '">' + esc(r.clean_title) + '</a></div>' +
         '<div class="torrent-name">' + esc(r.torrent_name) + '</div>' +
       '</div></td>' +
+      '<td><div class="magnet-cell">' +
+        '<a href="' + esc(r.magnet) + '" title="Open in torrent client">Open</a>' +
+        '<button type="button" class="copy-magnet" data-magnet="' + esc(r.magnet) + '" title="Copy magnet link">Copy</button>' +
+      '</div></td>' +
       '<td><span class="genre-cell">' + esc(r.genre) + '</span></td>' +
       '<td><div class="summary-cell">' + esc(r.summary) + '</div></td>' +
       '<td><div class="score-cell">' + (scores.length ? scores.join("") : "\u2014") + '</div></td>' +
@@ -427,6 +448,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     tbody.appendChild(tr);
   }
+
+  tbody.addEventListener("click", function(e) {
+    var btn = e.target.closest(".copy-magnet");
+    if (!btn) return;
+    e.preventDefault();
+    var magnet = btn.getAttribute("data-magnet") || "";
+    var restore = btn.textContent;
+    var done = function() {
+      btn.textContent = "Copied!";
+      btn.classList.add("copied");
+      setTimeout(function() {
+        btn.textContent = restore;
+        btn.classList.remove("copied");
+      }, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(magnet).then(done, function() {
+        window.prompt("Copy magnet link:", magnet);
+      });
+    } else {
+      window.prompt("Copy magnet link:", magnet);
+    }
+  });
 
   var source = new EventSource("/api/rows");
 
